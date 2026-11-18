@@ -1,0 +1,79 @@
+name: Sync forks
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    name: ${{ matrix.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fork: curl
+            upstream: curl/curl
+            branch: master
+            key: CURL_DEPLOY_KEY
+          - fork: litellm
+            upstream: BerriAI/litellm
+            branch: main
+            key: LITELLM_DEPLOY_KEY
+          - fork: FFmpeg
+            upstream: FFmpeg/FFmpeg
+            branch: master
+            key: FFMPEG_DEPLOY_KEY
+          - fork: tomcat-1
+            upstream: apache/tomcat
+            branch: main
+            key: TOMCAT_1_DEPLOY_KEY
+    concurrency:
+      group: sync-${{ matrix.fork }}
+      cancel-in-progress: false
+    steps:
+      - name: Fast-forward fork to upstream
+        env:
+          FORK: ${{ github.repository_owner }}/${{ matrix.fork }}
+          UPSTREAM: ${{ matrix.upstream }}
+          BRANCH: ${{ matrix.branch }}
+          DEPLOY_KEY: ${{ secrets[matrix.key] }}
+        run: |
+          set -euo pipefail
+
+          upstream_url="https://github.com/${UPSTREAM}.git"
+          fork_url="https://github.com/${FORK}.git"
+          ref="refs/heads/${BRANCH}"
+
+          upstream_sha=$(git ls-remote "$upstream_url" "$ref" | cut -f1)
+          fork_sha=$(git ls-remote "$fork_url" "$ref" | cut -f1)
+          if [ -z "$upstream_sha" ] || [ -z "$fork_sha" ]; then
+            echo "::error::Could not resolve ${ref} (upstream='${upstream_sha}', fork='${fork_sha}')"
+            exit 1
+          fi
+          if [ "$upstream_sha" = "$fork_sha" ]; then
+            echo "Already up to date at ${fork_sha}"
+            exit 0
+          fi
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+
+          # A shallow fetch of the fork tip is enough for upstream to send only
+          # the commits the fork is missing, so large histories are never cloned.
+          git init -q sync
+          cd sync
+          git fetch -q --depth=1 "$fork_url" "$fork_sha"
+          git fetch -q "$upstream_url" "$ref"
+
+          # No force: a fork that has diverged from upstream fails here instead
+          # of being overwritten.
+          git push "git@github.com:${FORK}.git" "FETCH_HEAD:${ref}"
+          echo "Synced ${FORK} ${BRANCH}: ${fork_sha} -> ${upstream_sha}" | tee -a "$GITHUB_STEP_SUMMARY"
